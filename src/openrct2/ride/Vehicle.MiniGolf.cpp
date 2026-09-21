@@ -27,9 +27,135 @@
 #include "ted/PitchAndRoll.h"
 #include "ted/TrackElementDescriptor.h"
 
+#include <cstddef>
+#include <optional>
+
 using namespace OpenRCT2;
 using namespace OpenRCT2::RideVehicle;
 using namespace OpenRCT2::TrackMetadata;
+
+namespace
+{
+    constexpr size_t kMaxMiniGolfTrackElements = 8192;
+
+    struct MiniGolfHole
+    {
+        CoordsXYZ location;
+        TrackElemType trackType;
+    };
+
+    bool IsSameHole(const MiniGolfHole& lhs, const MiniGolfHole& rhs)
+    {
+        return lhs.location == rhs.location && lhs.trackType == rhs.trackType;
+    }
+
+    bool IsAtHole(const Vehicle& vehicle, const MiniGolfHole& hole)
+    {
+        return vehicle.TrackLocation == hole.location && vehicle.GetTrackType() == hole.trackType;
+    }
+
+    std::optional<MiniGolfHole> FindNextMiniGolfHole(const Vehicle& vehicle)
+    {
+        auto* tileElement = MapGetTrackElementAtOfTypeSeq(vehicle.TrackLocation, vehicle.GetTrackType(), 0);
+        if (tileElement == nullptr)
+            return std::nullopt;
+
+        std::optional<MiniGolfHole> currentHole;
+        if (GetTrackElementDescriptor(vehicle.GetTrackType()).flags.has(TrackElementFlag::isGolfHole))
+        {
+            currentHole = MiniGolfHole{ vehicle.TrackLocation, vehicle.GetTrackType() };
+        }
+
+        CoordsXYE current = { vehicle.TrackLocation, tileElement };
+        for (size_t i = 0; i < kMaxMiniGolfTrackElements; i++)
+        {
+            CoordsXYE next;
+            int32_t nextZ{};
+            if (!trackBlockGetNext(&current, &next, &nextZ, nullptr))
+                return std::nullopt;
+
+            const auto trackType = next.element->asTrack()->getTrackType();
+            if (trackType == TrackElemType::endStation)
+                return std::nullopt;
+
+            const auto& ted = GetTrackElementDescriptor(trackType);
+            if (ted.flags.has(TrackElementFlag::isGolfHole) && next.element->asTrack()->getSequenceIndex() == 0)
+            {
+                MiniGolfHole nextHole{ { next.x, next.y, nextZ }, trackType };
+                if (!currentHole.has_value() || !IsSameHole(*currentHole, nextHole))
+                    return nextHole;
+            }
+
+            current = next;
+        }
+
+        return std::nullopt;
+    }
+
+    bool HasPendingGolferForHole(const Ride& ride, const MiniGolfHole& hole, const Vehicle& golfer)
+    {
+        auto& entities = getGameState().entities;
+        for (size_t i = 0; i < ride.numTrains; i++)
+        {
+            for (auto* vehicle = entities.getEntity<Vehicle>(ride.vehicles[i]); vehicle != nullptr;
+                 vehicle = entities.getEntity<Vehicle>(vehicle->next_vehicle_on_train))
+            {
+                if (vehicle == &golfer || vehicle->IsHead() || vehicle->num_peeps == 0)
+                    continue;
+
+                if (vehicle->miniGolfFlags.has(MiniGolfFlag::flag3) && IsAtHole(*vehicle, hole))
+                    return true;
+
+                if (vehicle->miniGolfFlags.has(MiniGolfFlag::flag5) && IsAtHole(*vehicle, hole))
+                    return true;
+
+                if (!vehicle->miniGolfFlags.has(MiniGolfFlag::teeReserved))
+                    continue;
+
+                if (IsAtHole(*vehicle, hole))
+                    return true;
+
+                const auto reservedHole = FindNextMiniGolfHole(*vehicle);
+                if (reservedHole.has_value() && reservedHole->location == hole.location
+                    && reservedHole->trackType == hole.trackType)
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    Vehicle* GetMiniGolfGolfer(Vehicle& vehicle)
+    {
+        if (!vehicle.IsHead())
+            return &vehicle;
+
+        return getGameState().entities.getEntity<Vehicle>(vehicle.next_vehicle_on_train);
+    }
+
+    bool TryReserveNextMiniGolfTee(const Ride& ride, Vehicle& vehicle)
+    {
+        auto* golfer = GetMiniGolfGolfer(vehicle);
+        if (golfer == nullptr)
+            return true;
+
+        if (golfer->miniGolfFlags.has(MiniGolfFlag::teeReserved))
+            return true;
+
+        const auto nextHole = FindNextMiniGolfHole(*golfer);
+        if (!nextHole.has_value())
+        {
+            golfer->miniGolfFlags.unset(MiniGolfFlag::teeReserved);
+            return true;
+        }
+
+        if (HasPendingGolferForHole(ride, *nextHole, *golfer))
+            return false;
+
+        golfer->miniGolfFlags.set(MiniGolfFlag::teeReserved);
+        return true;
+    }
+} // namespace
 
 void OpenRCT2::RideUpdateMeasurementsSpecialElements_MiniGolf(Ride& ride, const TrackElemType trackType)
 {
@@ -315,6 +441,8 @@ void OpenRCT2::RideUpdateMeasurementsSpecialElements_MiniGolf(Ride& ride, const 
                 case MiniGolfState::unk0: // Loc6DC7B4
                     if (!IsHead())
                     {
+                        miniGolfFlags.unset(MiniGolfFlag::teeReserved);
+                        miniGolfFlags.unset(MiniGolfFlag::flag4);
                         miniGolfFlags.set(MiniGolfFlag::flag3);
                     }
                     else
@@ -381,8 +509,30 @@ void OpenRCT2::RideUpdateMeasurementsSpecialElements_MiniGolf(Ride& ride, const 
                     track_progress++;
                     break;
                 case MiniGolfState::unk6: // Loc6DC88A
+                    if (!TryReserveNextMiniGolfTee(curRide, *this))
+                    {
+                        remaining_distance -= 0x368A;
+                        if (remaining_distance < 0)
+                        {
+                            remaining_distance = 0;
+                        }
+
+                        if (remaining_distance < 0x368A)
+                        {
+                            Loc6DCDE4(curRide);
+                            return UpdateMiniGolfSubroutineStatus::stop;
+                        }
+                        acceleration = Geometry::getAccelerationFromPitch(pitch);
+                        _vehicleSubpositionsMoved++;
+                        continue;
+                    }
                     miniGolfFlags.unset(MiniGolfFlag::flag4);
                     miniGolfFlags.set(MiniGolfFlag::flag5);
+                    if (auto* golfer = GetMiniGolfGolfer(*this); golfer != nullptr && golfer != this)
+                    {
+                        golfer->miniGolfFlags.unset(MiniGolfFlag::flag4);
+                        golfer->miniGolfFlags.set(MiniGolfFlag::flag5);
+                    }
                     track_progress++;
                     break;
                 default:

@@ -10,6 +10,7 @@
 #include "TestData.h"
 
 #include <gtest/gtest.h>
+#include <map>
 #include <memory>
 #include <openrct2/Context.h>
 #include <openrct2/Game.h>
@@ -30,9 +31,11 @@
 #include <openrct2/object/ObjectManager.h>
 #include <openrct2/ride/Ride.h>
 #include <openrct2/ride/RideManager.hpp>
+#include <openrct2/ride/Vehicle.h>
 #include <openrct2/world/MapAnimation.h>
 #include <openrct2/world/Park.h>
 #include <string>
+#include <tuple>
 
 using namespace OpenRCT2;
 
@@ -211,4 +214,102 @@ TEST_F(PlayTests, CarRideWithOneCarOnlyAcceptsTwoGuests)
         ASSERT_LE(numRiding, 2);
         gameStateUpdateLogic();
     }
+}
+
+TEST_F(PlayTests, MiniGolfLimitsEachTeeToOneWaitingGuest)
+{
+    auto context = localStartGame(TestData::GetParkPath("bpb.sv6"));
+    ASSERT_NE(context.get(), nullptr);
+
+    auto& gameState = getGameState();
+    auto rideManager = RideManager(gameState);
+    auto it = std::find_if(rideManager.begin(), rideManager.end(), [](auto& ride) { return ride.type == RIDE_TYPE_MINI_GOLF; });
+    ASSERT_NE(it, rideManager.end());
+
+    Ride& ride = *it;
+
+    auto getGolfers = [&]() {
+        std::vector<Vehicle*> golfers;
+        for (size_t i = 0; i < ride.numTrains; i++)
+        {
+            auto* head = gameState.entities.getEntity<Vehicle>(ride.vehicles[i]);
+            if (head == nullptr)
+                continue;
+
+            auto* golfer = gameState.entities.getEntity<Vehicle>(head->next_vehicle_on_train);
+            if (golfer != nullptr && golfer->num_peeps != 0)
+                golfers.push_back(golfer);
+        }
+        return golfers;
+    };
+
+    auto getMaxGolfersWithFlagAtSameHole = [&](MiniGolfFlag flag) {
+        using HoleKey = std::tuple<int32_t, int32_t, int32_t, TrackElemType>;
+        std::map<HoleKey, size_t> counts;
+        size_t maximum = 0;
+        for (const auto* golfer : getGolfers())
+        {
+            if (!golfer->miniGolfFlags.has(flag))
+                continue;
+
+            const auto trackType = golfer->GetTrackType();
+            if (trackType < TrackElemType::minigolfHoleA || trackType > TrackElemType::minigolfHoleE)
+                continue;
+
+            const auto& location = golfer->TrackLocation;
+            const auto count = ++counts[{ location.x, location.y, location.z, trackType }];
+            maximum = std::max(maximum, count);
+        }
+        return maximum;
+    };
+
+    // This legacy save already contains the vanilla bug: three golfers share the waiting position on hole D.
+    ASSERT_GT(getMaxGolfersWithFlagAtSameHole(MiniGolfFlag::flag3), 1u);
+
+    execute<GameActions::RideSetPriceAction>(ride.id, 0, true);
+    gameState.cheats.ignoreRideIntensity = true;
+    const auto initialCustomers = ride.totalCustomers;
+
+    // Keep the entrance loaded while the legacy stack drains so that the new reservation logic is exercised continuously.
+    const auto& station = ride.getStation();
+    const auto entrance = station.entrance.toCoordsXYZD().toTileCentre();
+    for (int32_t i = 0; i < 30; i++)
+    {
+        auto* guest = Park::GenerateGuest();
+        guest->cashInPocket = 3000;
+        guest->currentRide = ride.id;
+        guest->currentRideStation = StationIndex::FromUnderlying(0);
+        const auto offset = DirectionOffsets[entrance.direction] * 32;
+        const CoordsXYZ destination = { entrance + offset, entrance.z };
+        guest->setDestination(destination, 2);
+        guest->setState(PeepState::enteringRide);
+        guest->rideSubState = PeepRideSubState::inEntrance;
+        guest->moveTo(destination);
+    }
+
+    bool legacyStackDrained = false;
+    bool sawReservation = false;
+    bool sawMoreRidersThanHolesAfterConvergence = false;
+    for (int32_t tick = 0; tick < 5000; tick++)
+    {
+        gameStateUpdateLogic();
+
+        ASSERT_LE(getMaxGolfersWithFlagAtSameHole(MiniGolfFlag::flag4), 1u);
+        const auto maxWaiting = getMaxGolfersWithFlagAtSameHole(MiniGolfFlag::flag3);
+        if (maxWaiting <= 1)
+            legacyStackDrained = true;
+        if (legacyStackDrained)
+            ASSERT_LE(maxWaiting, 1u);
+
+        for (const auto* golfer : getGolfers())
+        {
+            sawReservation |= golfer->miniGolfFlags.has(MiniGolfFlag::teeReserved);
+        }
+        sawMoreRidersThanHolesAfterConvergence |= legacyStackDrained && ride.numRiders > ride.numHoles;
+    }
+
+    EXPECT_TRUE(legacyStackDrained);
+    EXPECT_TRUE(sawReservation);
+    EXPECT_GT(ride.totalCustomers, initialCustomers);
+    EXPECT_TRUE(sawMoreRidersThanHolesAfterConvergence);
 }

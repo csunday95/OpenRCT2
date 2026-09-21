@@ -72,12 +72,13 @@ namespace OpenRCT2
 
     enum class MiniGolfFlag : uint8_t
     {
-        flag0,
-        flag1,
-        flag2,
-        flag3,
-        flag4,
-        flag5, // transitioning between hole
+        flag0,       // paired ball/golfer synchronisation barrier
+        flag1,       // paired ball/golfer synchronisation barrier
+        flag2,       // golfer animation in progress
+        flag3,       // visibly waiting at a tee
+        flag4,       // actively playing a hole
+        flag5,       // transitioning between holes
+        teeReserved, // travelling toward a reserved tee
     };
 
     using MiniGolfFlags = FlagHolder<uint8_t, MiniGolfFlag>;
